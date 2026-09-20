@@ -1,0 +1,110 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements. See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership. The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License. You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied. See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: PR 18161 dependency diagnosis
+
+on:
+  push:
+    branches: [validate/iceberg-18161-deps-20260920]
+    paths: [.github/workflows/validate-18161-dependencies.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iceberg-18161-deps-20260920
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    if: github.repository == 'sankalpsthakur/iceberg'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: base
+            sha: 778d103c0fa802be5e85e4cb2e4e4b4bcd8ac891
+          - label: failed-merge
+            sha: 2d2769711530534f9637150f8803bff38cdba6e9
+    env:
+      SOURCE_SHA: ${{ matrix.sha }}
+      GRADLE_USER_HOME: ${{ runner.temp }}/isolated-gradle-home
+    steps:
+      - name: Fetch historical source without credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir evidence
+          git init source
+          git -C source remote add origin https://github.com/apache/iceberg.git
+          git -C source fetch --no-tags --depth=1 origin "$SOURCE_SHA"
+          git -C source checkout --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git -C source status --porcelain)"
+          git -C source rev-parse HEAD HEAD^{tree} > evidence/source.txt
+          echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_17_X64/bin" >> "$GITHUB_PATH"
+      - name: Resolve existing test runtime classpath without compiling or running tests
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          java -version 2>&1 | tee ../evidence/java.txt
+          cat > ../resolve.gradle <<'GRADLE'
+          gradle.projectsEvaluated {
+            def target = gradle.rootProject.project(':iceberg-mr')
+            target.tasks.register('diagnoseTestRuntimeClasspath') {
+              doLast {
+                def configuration = target.configurations.getByName('testRuntimeClasspath')
+                def files = configuration.resolve()
+                println('RESOLUTION_SUCCESS file_count=' + files.size())
+                configuration.resolvedConfiguration.resolvedArtifacts.each { artifact ->
+                  println('RESOLVED ' + artifact.moduleVersion.id.toString())
+                }
+              }
+            }
+          }
+          GRADLE
+          set +e
+          ./gradlew --no-daemon --console=plain --stacktrace \
+            -DsparkVersions= -DflinkVersions= -DkafkaVersions= -Pquick=true \
+            --init-script ../resolve.gradle :iceberg-mr:diagnoseTestRuntimeClasspath \
+            2>&1 | tee ../evidence/resolution.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          printf '%s\n' "$rc" > ../evidence/resolution.exit
+          test "$rc" -eq 0
+          grep -q 'RESOLUTION_SUCCESS file_count=' ../evidence/resolution.log
+      - name: Verify source integrity
+        if: always()
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git diff --exit-code HEAD
+          git status --short > ../evidence/final-status.txt
+      - name: Retain diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: iceberg-18161-dependencies-${{ matrix.label }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 14
