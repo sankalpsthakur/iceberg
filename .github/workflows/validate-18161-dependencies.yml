@@ -44,7 +44,6 @@ jobs:
             sha: 2d2769711530534f9637150f8803bff38cdba6e9
     env:
       SOURCE_SHA: ${{ matrix.sha }}
-      GRADLE_USER_HOME: ${{ runner.temp }}/isolated-gradle-home
     steps:
       - name: Fetch historical source without credentials
         shell: bash
@@ -58,6 +57,7 @@ jobs:
           test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
           test -z "$(git -C source status --porcelain)"
           git -C source rev-parse HEAD HEAD^{tree} > evidence/source.txt
+          echo "GRADLE_USER_HOME=$RUNNER_TEMP/isolated-gradle-home" >> "$GITHUB_ENV"
           echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
           echo "$JAVA_HOME_17_X64/bin" >> "$GITHUB_PATH"
       - name: Resolve existing test runtime classpath without compiling or running tests
