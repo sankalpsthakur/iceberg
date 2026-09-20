@@ -67,15 +67,16 @@ jobs:
           set -euo pipefail
           java -version 2>&1 | tee ../evidence/java.txt
           cat > ../resolve.gradle <<'GRADLE'
-          gradle.projectsEvaluated {
-            def target = gradle.rootProject.project(':iceberg-mr')
-            target.tasks.register('diagnoseTestRuntimeClasspath') {
-              doLast {
-                def configuration = target.configurations.getByName('testRuntimeClasspath')
-                def files = configuration.resolve()
-                println('RESOLUTION_SUCCESS file_count=' + files.size())
-                configuration.resolvedConfiguration.resolvedArtifacts.each { artifact ->
-                  println('RESOLVED ' + artifact.moduleVersion.id.toString())
+          gradle.beforeProject { target ->
+            if (target.path == ':iceberg-mr') {
+              target.tasks.register('diagnoseTestRuntimeClasspath') {
+                doLast {
+                  def configuration = target.configurations.getByName('testRuntimeClasspath')
+                  def files = configuration.resolve()
+                  println('RESOLUTION_SUCCESS file_count=' + files.size())
+                  configuration.resolvedConfiguration.resolvedArtifacts.each { artifact ->
+                    println('RESOLVED ' + artifact.moduleVersion.id.toString())
+                  }
                 }
               }
             }
