@@ -26,7 +26,10 @@ import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
 import org.apache.iceberg.Files;
+import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.data.GenericRecord;
@@ -144,6 +147,77 @@ public class TestVectorizedOrcDataReader {
   }
 
   @Test
+  void rowLineageUnmaterialized() throws IOException {
+    Schema dataSchema = new Schema(Types.NestedField.required(1, "id", Types.LongType.get()));
+    OutputFile lineageFile = writeRecords(dataSchema, recordsWithIds(dataSchema, 4));
+
+    validateLineageRows(
+        lineageFile,
+        List.of(
+            rowValues(0L, 100L, 5L),
+            rowValues(1L, 101L, 5L),
+            rowValues(2L, 102L, 5L),
+            rowValues(3L, 103L, 5L)));
+  }
+
+  @Test
+  void rowLineageMaterializedAndNulls() throws IOException {
+    Schema dataSchema = new Schema(Types.NestedField.required(1, "id", Types.LongType.get()));
+    Schema writeSchema = MetadataColumns.schemaWithRowLineage(dataSchema);
+    GenericRecord record = GenericRecord.create(writeSchema);
+
+    ImmutableList.Builder<Record> builder = ImmutableList.builder();
+    for (int i = 0; i < 4; i++) {
+      if (i % 2 == 0) {
+        builder.add(
+            record.copy(
+                ImmutableMap.of(
+                    "id",
+                    (long) i,
+                    MetadataColumns.ROW_ID.name(),
+                    555L + i,
+                    MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER.name(),
+                    7L)));
+      } else {
+        builder.add(record.copy(ImmutableMap.of("id", (long) i)));
+      }
+    }
+
+    OutputFile lineageFile = writeRecords(writeSchema, builder.build());
+
+    validateLineageRows(
+        lineageFile,
+        List.of(
+            rowValues(0L, 555L, 7L),
+            rowValues(1L, 101L, 5L),
+            rowValues(2L, 557L, 7L),
+            rowValues(3L, 103L, 5L)));
+  }
+
+  @Test
+  void rowLineageUnmaterializedWithSelected() throws IOException {
+    Schema dataSchema = new Schema(Types.NestedField.required(1, "id", Types.LongType.get()));
+    OutputFile lineageFile = writeRecords(dataSchema, recordsWithIds(dataSchema, 4));
+    Schema projection = lineageProjection();
+    Map<Integer, ?> idToConstant = lineageConstants();
+
+    try (CloseableIterable<ColumnarBatch> reader =
+        ORC.read(lineageFile.toInputFile())
+            .project(projection)
+            .createBatchedReaderFunc(
+                readOrcSchema ->
+                    VectorizedSparkOrcReaders.buildReader(projection, readOrcSchema, idToConstant))
+            .filter(Expressions.equal("id", 2L))
+            .config(OrcConf.ALLOW_SARG_TO_FILTER.getAttribute(), String.valueOf(true))
+            .config(OrcConf.READER_USE_SELECTED.getAttribute(), String.valueOf(true))
+            .build()) {
+      Iterator<InternalRow> rows = batchesToRows(reader.iterator());
+      assertLineageRow(rows.next(), 2L, 102L, 5L);
+      assertThat(rows).isExhausted();
+    }
+  }
+
+  @Test
   public void testWithFilterWithSelected() throws IOException {
     try (CloseableIterable<ColumnarBatch> reader =
         ORC.read(outputFile.toInputFile())
@@ -163,5 +237,78 @@ public class TestVectorizedOrcDataReader {
       assertThat(row.getArray(3).toIntArray()).isEqualTo(new int[] {3, 4, 5});
       assertThat(rows).isExhausted();
     }
+  }
+
+  private static Schema lineageProjection() {
+    return new Schema(
+        Types.NestedField.required(1, "id", Types.LongType.get()),
+        MetadataColumns.ROW_ID,
+        MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER);
+  }
+
+  private static Map<Integer, ?> lineageConstants() {
+    return ImmutableMap.of(
+        MetadataColumns.ROW_ID.fieldId(), 100L,
+        MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER.fieldId(), 5L);
+  }
+
+  private static long[] rowValues(long id, long rowId, long lastUpdatedSeq) {
+    return new long[] {id, rowId, lastUpdatedSeq};
+  }
+
+  private static List<Record> recordsWithIds(Schema schema, int count) {
+    GenericRecord record = GenericRecord.create(schema);
+    ImmutableList.Builder<Record> builder = ImmutableList.builder();
+    for (int i = 0; i < count; i++) {
+      builder.add(record.copy(ImmutableMap.of("id", (long) i)));
+    }
+
+    return builder.build();
+  }
+
+  private static OutputFile writeRecords(Schema schema, List<Record> records) throws IOException {
+    OutputFile lineageFile =
+        Files.localOutput(File.createTempFile("lineage", ".orc", temp.toFile()));
+    try (DataWriter<Record> dataWriter =
+        ORC.writeData(lineageFile)
+            .schema(schema)
+            .createWriterFunc(GenericOrcWriter::buildWriter)
+            .overwrite()
+            .withSpec(PartitionSpec.unpartitioned())
+            .build()) {
+      for (Record rec : records) {
+        dataWriter.write(rec);
+      }
+    }
+
+    return lineageFile;
+  }
+
+  private void validateLineageRows(OutputFile lineageFile, List<long[]> expectedRows)
+      throws IOException {
+    Schema projection = lineageProjection();
+    Map<Integer, ?> idToConstant = lineageConstants();
+
+    try (CloseableIterable<ColumnarBatch> reader =
+        ORC.read(lineageFile.toInputFile())
+            .project(projection)
+            .createBatchedReaderFunc(
+                readOrcSchema ->
+                    VectorizedSparkOrcReaders.buildReader(projection, readOrcSchema, idToConstant))
+            .build()) {
+      Iterator<InternalRow> rows = batchesToRows(reader.iterator());
+      for (long[] expected : expectedRows) {
+        assertLineageRow(rows.next(), expected[0], expected[1], expected[2]);
+      }
+
+      assertThat(rows).isExhausted();
+    }
+  }
+
+  private static void assertLineageRow(
+      InternalRow row, long expectedId, long expectedRowId, long expectedSeq) {
+    assertThat(row.getLong(0)).isEqualTo(expectedId);
+    assertThat(row.getLong(1)).isEqualTo(expectedRowId);
+    assertThat(row.getLong(2)).isEqualTo(expectedSeq);
   }
 }
