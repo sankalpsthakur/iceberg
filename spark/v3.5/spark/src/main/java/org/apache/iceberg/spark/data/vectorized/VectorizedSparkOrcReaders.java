@@ -20,14 +20,17 @@ package org.apache.iceberg.spark.data.vectorized;
 
 import java.util.List;
 import java.util.Map;
+import java.util.function.IntToLongFunction;
 import java.util.stream.IntStream;
 import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.Schema;
+import org.apache.iceberg.orc.ORCSchemaUtil;
 import org.apache.iceberg.orc.OrcBatchReader;
 import org.apache.iceberg.orc.OrcSchemaWithTypeVisitor;
 import org.apache.iceberg.orc.OrcValueReader;
 import org.apache.iceberg.orc.OrcValueReaders;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.spark.SparkSchemaUtil;
 import org.apache.iceberg.spark.data.SparkOrcValueReaders;
 import org.apache.iceberg.types.Type;
@@ -104,7 +107,7 @@ public class VectorizedSparkOrcReaders {
         TypeDescription record,
         List<String> names,
         List<Converter> fields) {
-      return new StructConverter(iStruct, fields, idToConstant);
+      return new StructConverter(iStruct, record, fields, idToConstant);
     }
 
     @Override
@@ -432,14 +435,17 @@ public class VectorizedSparkOrcReaders {
 
   private static class StructConverter implements Converter {
     private final Types.StructType structType;
+    private final Map<Integer, Integer> fieldIdToOrcIndex;
     private final List<Converter> fieldConverters;
     private final Map<Integer, ?> idToConstant;
 
     private StructConverter(
         Types.StructType structType,
+        TypeDescription orcType,
         List<Converter> fieldConverters,
         Map<Integer, ?> idToConstant) {
       this.structType = structType;
+      this.fieldIdToOrcIndex = buildFieldIdToOrcIndex(orcType);
       this.fieldConverters = fieldConverters;
       this.idToConstant = idToConstant;
     }
@@ -456,7 +462,15 @@ public class VectorizedSparkOrcReaders {
       List<ColumnVector> fieldVectors = Lists.newArrayListWithExpectedSize(fields.size());
       for (int pos = 0, vectorIndex = 0; pos < fields.size(); pos += 1) {
         Types.NestedField field = fields.get(pos);
-        if (idToConstant.containsKey(field.fieldId())) {
+        if (field.equals(MetadataColumns.ROW_ID)) {
+          fieldVectors.add(
+              rowIdVector(
+                  field, structVector, batchSize, batchOffsetInFile, isSelectedInUse, selected));
+        } else if (field.equals(MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER)) {
+          fieldVectors.add(
+              lastUpdatedSeqVector(
+                  field, structVector, batchSize, batchOffsetInFile, isSelectedInUse, selected));
+        } else if (idToConstant.containsKey(field.fieldId())) {
           fieldVectors.add(
               new ConstantColumnVector(field.type(), batchSize, idToConstant.get(field.fieldId())));
         } else if (field.equals(MetadataColumns.ROW_POSITION)) {
@@ -487,6 +501,178 @@ public class VectorizedSparkOrcReaders {
           return fieldVectors.get(ordinal);
         }
       };
+    }
+
+    private ColumnVector rowIdVector(
+        Types.NestedField field,
+        StructColumnVector structVector,
+        int batchSize,
+        long batchOffsetInFile,
+        boolean isSelectedInUse,
+        int[] selected) {
+      Long firstRowId = (Long) idToConstant.get(field.fieldId());
+      if (firstRowId == null) {
+        return new ConstantColumnVector(field.type(), batchSize, null);
+      }
+
+      return new CoalescedLongColumnVector(
+          storedVector(
+              field, structVector, batchSize, batchOffsetInFile, isSelectedInUse, selected),
+          rowId ->
+              firstRowId + batchOffsetInFile + physicalRowIndex(isSelectedInUse, selected, rowId));
+    }
+
+    private ColumnVector lastUpdatedSeqVector(
+        Types.NestedField field,
+        StructColumnVector structVector,
+        int batchSize,
+        long batchOffsetInFile,
+        boolean isSelectedInUse,
+        int[] selected) {
+      Long fileLastUpdated = (Long) idToConstant.get(field.fieldId());
+      Long firstRowId = (Long) idToConstant.get(MetadataColumns.ROW_ID.fieldId());
+      if (fileLastUpdated == null || firstRowId == null) {
+        return new ConstantColumnVector(field.type(), batchSize, null);
+      }
+
+      return new CoalescedLongColumnVector(
+          storedVector(
+              field, structVector, batchSize, batchOffsetInFile, isSelectedInUse, selected),
+          ignored -> fileLastUpdated);
+    }
+
+    private ColumnVector storedVector(
+        Types.NestedField field,
+        StructColumnVector structVector,
+        int batchSize,
+        long batchOffsetInFile,
+        boolean isSelectedInUse,
+        int[] selected) {
+      Integer orcIndex = fieldIdToOrcIndex.get(field.fieldId());
+      if (orcIndex == null) {
+        return null;
+      }
+
+      return fieldConverters
+          .get(orcIndex)
+          .convert(
+              structVector.fields[orcIndex],
+              batchSize,
+              batchOffsetInFile,
+              isSelectedInUse,
+              selected);
+    }
+
+    private static int physicalRowIndex(boolean isSelectedInUse, int[] selected, int rowId) {
+      return isSelectedInUse ? selected[rowId] : rowId;
+    }
+
+    private static Map<Integer, Integer> buildFieldIdToOrcIndex(TypeDescription orcType) {
+      List<TypeDescription> children = orcType.getChildren();
+      Map<Integer, Integer> mapping = Maps.newHashMap();
+      for (int i = 0; i < children.size(); i++) {
+        mapping.put(ORCSchemaUtil.fieldId(children.get(i)), i);
+      }
+
+      return mapping;
+    }
+  }
+
+  private static class CoalescedLongColumnVector extends ColumnVector {
+    private final ColumnVector stored;
+    private final IntToLongFunction fallback;
+
+    CoalescedLongColumnVector(ColumnVector stored, IntToLongFunction fallback) {
+      super(SparkSchemaUtil.convert(Types.LongType.get()));
+      this.stored = stored;
+      this.fallback = fallback;
+    }
+
+    @Override
+    public long getLong(int rowId) {
+      if (stored != null && !stored.isNullAt(rowId)) {
+        return stored.getLong(rowId);
+      }
+
+      return fallback.applyAsLong(rowId);
+    }
+
+    @Override
+    public void close() {}
+
+    @Override
+    public boolean hasNull() {
+      return false;
+    }
+
+    @Override
+    public int numNulls() {
+      return 0;
+    }
+
+    @Override
+    public boolean isNullAt(int rowId) {
+      return false;
+    }
+
+    @Override
+    public boolean getBoolean(int rowId) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public byte getByte(int rowId) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public short getShort(int rowId) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public int getInt(int rowId) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public float getFloat(int rowId) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public double getDouble(int rowId) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public ColumnarArray getArray(int rowId) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public ColumnarMap getMap(int ordinal) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public Decimal getDecimal(int rowId, int precision, int scale) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public UTF8String getUTF8String(int rowId) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public byte[] getBinary(int rowId) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public ColumnVector getChild(int ordinal) {
+      throw new UnsupportedOperationException();
     }
   }
 }
