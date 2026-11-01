@@ -44,6 +44,7 @@ import org.apache.iceberg.TestHelpers;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.expressions.Binder;
 import org.apache.iceberg.expressions.BoundPredicate;
+import org.apache.iceberg.expressions.Evaluator;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.expressions.ManifestEvaluator;
@@ -54,7 +55,10 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.types.Conversions;
 import org.apache.iceberg.types.Types;
+import org.apache.iceberg.util.DateTimeUtil;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 public class TestProjection {
   private static final Schema SCHEMA = new Schema(optional(16, "id", Types.LongType.get()));
@@ -437,5 +441,31 @@ public class TestProjection {
                     Conversions.toByteBuffer(Types.TimestampType.withZone(), 0L))),
             null);
     assertThat(ManifestEvaluator.forRowFilter(hourFilter, spec, true).eval(manifest)).isTrue();
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"2026-01-01T00:00:00.000000001", "1970-01-02T00:00:00.000000001"})
+  void identityProjectionOfTimestampNanoIn(String ts) {
+    Schema schema = new Schema(optional(1, "ts", Types.TimestampNanoType.withoutZone()));
+    PartitionSpec spec = PartitionSpec.builderFor(schema).identity("ts").build();
+    Expression in = Expressions.in("ts", ts, "1970-01-03T00:00:00");
+
+    Expression projected = Projections.inclusive(spec).project(in);
+
+    Evaluator evaluator = new Evaluator(spec.partitionType(), projected);
+    assertThat(evaluator.eval(TestHelpers.Row.of(DateTimeUtil.isoTimestampToNanos(ts)))).isTrue();
+  }
+
+  @Test
+  void identityStrictProjectionOfTimestampNanoNotIn() {
+    String ts = "1970-01-02T00:00:00.000000001";
+    Schema schema = new Schema(optional(1, "ts", Types.TimestampNanoType.withoutZone()));
+    PartitionSpec spec = PartitionSpec.builderFor(schema).identity("ts").build();
+    Expression notIn = Expressions.notIn("ts", ts, "1970-01-03T00:00:00");
+
+    Expression projected = Projections.strict(spec).project(notIn);
+
+    Evaluator evaluator = new Evaluator(spec.partitionType(), projected);
+    assertThat(evaluator.eval(TestHelpers.Row.of(DateTimeUtil.isoTimestampToNanos(ts)))).isFalse();
   }
 }

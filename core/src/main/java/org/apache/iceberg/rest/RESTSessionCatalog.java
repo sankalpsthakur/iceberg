@@ -36,12 +36,14 @@ import org.apache.iceberg.BaseTable;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.CatalogUtil;
 import org.apache.iceberg.EnvironmentContext;
+import org.apache.iceberg.Labels;
 import org.apache.iceberg.MetadataTableType;
 import org.apache.iceberg.MetadataTableUtils;
 import org.apache.iceberg.MetadataUpdate;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.SortOrder;
+import org.apache.iceberg.StaticTableOperations;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableOperations;
@@ -99,6 +101,7 @@ import org.apache.iceberg.rest.responses.ListNamespacesResponse;
 import org.apache.iceberg.rest.responses.ListTablesResponse;
 import org.apache.iceberg.rest.responses.LoadTableResponse;
 import org.apache.iceberg.rest.responses.LoadViewResponse;
+import org.apache.iceberg.rest.responses.UnregisterTableResponse;
 import org.apache.iceberg.rest.responses.UpdateNamespacePropertiesResponse;
 import org.apache.iceberg.util.EnvironmentUtil;
 import org.apache.iceberg.util.PropertyUtil;
@@ -214,12 +217,17 @@ public class RESTSessionCatalog extends BaseViewSessionCatalog
     }
 
     // build the final configuration and set up the catalog's auth
-    Map<String, String> mergedProps = config.merge(props);
+    ImmutableMap.Builder<String, String> mergedPropsBuilder =
+        ImmutableMap.<String, String>builder().putAll(config.merge(props));
 
     // Enable Idempotency-Key header for mutation endpoints if the server advertises support
     if (config.idempotencyKeyLifetime() != null) {
       this.mutationHeaders = RESTUtil::idempotencyHeaders;
+      mergedPropsBuilder.put(
+          HTTPClient.REST_IDEMPOTENCY_KEY_LIFETIME, config.idempotencyKeyLifetime());
     }
+
+    Map<String, String> mergedProps = mergedPropsBuilder.buildKeepingLast();
 
     if (config.endpoints().isEmpty()) {
       this.endpoints =
@@ -579,6 +587,7 @@ public class RESTSessionCatalog extends BaseViewSessionCatalog
 
     List<Credential> credentials = response.credentials();
     RemoteSigningConfig remoteSigningConfig = response.remoteSigningConfig();
+    Labels labels = response.labels();
     RESTClient tableClient = client.withAuthSession(tableSession);
     Supplier<BaseTable> tableSupplier =
         createTableSupplier(
@@ -589,7 +598,8 @@ public class RESTSessionCatalog extends BaseViewSessionCatalog
             tableConf,
             loadContext,
             credentials,
-            remoteSigningConfig);
+            remoteSigningConfig,
+            labels);
 
     String eTag = responseHeaders.getOrDefault(HttpHeaders.ETAG, null);
     if (eTag != null) {
@@ -611,7 +621,8 @@ public class RESTSessionCatalog extends BaseViewSessionCatalog
       Map<String, String> tableConf,
       LoadContext loadContext,
       List<Credential> credentials,
-      RemoteSigningConfig remoteSigningConfig) {
+      RemoteSigningConfig remoteSigningConfig,
+      Labels labels) {
     Map<String, String> readQueryParams =
         referencedByParam(loadContext, RESTCatalogProperties.REFERENCED_BY_QUERY_PARAMETER);
 
@@ -630,13 +641,16 @@ public class RESTSessionCatalog extends BaseViewSessionCatalog
 
       trackFileIO(ops);
 
-      RESTTable table = restTableForScanPlanning(ops, identifier, tableClient, tableConf);
+      RESTTable table = restTableForScanPlanning(ops, identifier, tableClient, tableConf, labels);
       if (table != null) {
         return table;
       }
 
       return new BaseTable(
-          ops, fullTableName(identifier), metricsReporter(paths.metrics(identifier), tableClient));
+          ops,
+          fullTableName(identifier),
+          metricsReporter(paths.metrics(identifier), tableClient),
+          labels);
     };
   }
 
@@ -644,7 +658,8 @@ public class RESTSessionCatalog extends BaseViewSessionCatalog
       TableOperations ops,
       TableIdentifier finalIdentifier,
       RESTClient restClient,
-      Map<String, String> tableConf) {
+      Map<String, String> tableConf,
+      Labels labels) {
     String planningModeServerConfig = tableConf.get(RESTCatalogProperties.SCAN_PLANNING_MODE);
     ScanPlanningMode serverScanPlanningMode =
         planningModeServerConfig == null
@@ -689,7 +704,8 @@ public class RESTSessionCatalog extends BaseViewSessionCatalog
           paths,
           endpoints,
           properties(),
-          conf);
+          conf,
+          labels);
     }
 
     // Default to client-side planning
@@ -783,13 +799,51 @@ public class RESTSessionCatalog extends BaseViewSessionCatalog
 
     trackFileIO(ops);
 
-    RESTTable restTable = restTableForScanPlanning(ops, ident, tableClient, tableConf);
+    RESTTable restTable =
+        restTableForScanPlanning(ops, ident, tableClient, tableConf, response.labels());
     if (restTable != null) {
       return restTable;
     }
 
     return new BaseTable(
-        ops, fullTableName(ident), metricsReporter(paths.metrics(ident), tableClient));
+        ops,
+        fullTableName(ident),
+        metricsReporter(paths.metrics(ident), tableClient),
+        response.labels());
+  }
+
+  /**
+   * Unregister a table from the catalog without removing its data or metadata files.
+   *
+   * <p>This is the opposite of {@link #registerTable(SessionContext, TableIdentifier, String)}. On
+   * success, the table no longer exists in the catalog and the returned table is fixed at the last
+   * metadata registered with the catalog.
+   *
+   * @param context session context
+   * @param identifier a table identifier
+   * @return a read-only table fixed at the metadata current when it was unregistered
+   */
+  @Override
+  public Table unregisterTable(SessionContext context, TableIdentifier identifier) {
+    Endpoint.check(endpoints, Endpoint.V1_UNREGISTER_TABLE);
+    checkIdentifierIsValid(identifier);
+
+    try {
+      AuthSession contextualSession = authManager.contextualSession(context, catalogAuth);
+      UnregisterTableResponse response =
+          client
+              .withAuthSession(contextualSession)
+              .post(
+                  paths.unregister(identifier),
+                  null,
+                  UnregisterTableResponse.class,
+                  mutationHeaders,
+                  ErrorHandlers.tableErrorHandler());
+      StaticTableOperations ops = new StaticTableOperations(response.metadata(), io);
+      return new BaseTable(ops, identifier.name());
+    } finally {
+      invalidateTable(context, identifier);
+    }
   }
 
   @Override
@@ -1059,13 +1113,17 @@ public class RESTSessionCatalog extends BaseViewSessionCatalog
 
       trackFileIO(ops);
 
-      RESTTable restTable = restTableForScanPlanning(ops, ident, tableClient, tableConf);
+      RESTTable restTable =
+          restTableForScanPlanning(ops, ident, tableClient, tableConf, response.labels());
       if (restTable != null) {
         return restTable;
       }
 
       return new BaseTable(
-          ops, fullTableName(ident), metricsReporter(paths.metrics(ident), tableClient));
+          ops,
+          fullTableName(ident),
+          metricsReporter(paths.metrics(ident), tableClient),
+          response.labels());
     }
 
     @Override
@@ -1321,32 +1379,6 @@ public class RESTSessionCatalog extends BaseViewSessionCatalog
     }
 
     return newFileIO(context, fullConf.buildKeepingLast(), storageCredentials);
-  }
-
-  /**
-   * Create a new {@link RESTTableOperations} instance for simple table operations.
-   *
-   * @deprecated since 1.12.0, will be removed in 1.13.0; use {@link #newTableOps(RESTClient,
-   *     String, Supplier, Supplier, FileIO, TableMetadata, Set, Map)} instead.
-   */
-  @Deprecated
-  protected RESTTableOperations newTableOps(
-      RESTClient restClient,
-      String path,
-      Supplier<Map<String, String>> readHeaders,
-      Supplier<Map<String, String>> mutationHeaderSupplier,
-      FileIO fileIO,
-      TableMetadata current,
-      Set<Endpoint> supportedEndpoints) {
-    return newTableOps(
-        restClient,
-        path,
-        readHeaders,
-        mutationHeaderSupplier,
-        fileIO,
-        current,
-        supportedEndpoints,
-        Map.of());
   }
 
   /**
